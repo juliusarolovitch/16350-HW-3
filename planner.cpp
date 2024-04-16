@@ -809,16 +809,6 @@ static auto compare = [](const shared_ptr<Node> &n1, const shared_ptr<Node> &n2)
     return n1->f > n2->f;
 };
 
-struct ActionNode
-{
-    unordered_map<GroundedCondition, shared_ptr<ActionNode>, GroundedConditionHasher, GroundedConditionComparator> ActionNodeNext;
-    vector<pair<unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator>, GroundedAction>> value;
-    bool end;
-
-    ActionNode() : end(false) {}
-};
-
-ActionNode rm;
 priority_queue<shared_ptr<Node>, vector<shared_ptr<Node>>, decltype(compare)> open(compare);
 unordered_map<set<GroundedCondition, GCComparator>, shared_ptr<Node>, NodeHasher, PlannerComparator> nodes;
 unordered_set<set<GroundedCondition, GCComparator>, NodeHasher, PlannerComparator> closed;
@@ -848,6 +838,17 @@ list<GroundedAction> backtrack(std::__1::shared_ptr<Node> s, set<GroundedConditi
     plan.reverse();
     return plan;
 }
+
+struct ActionNode
+{
+    unordered_map<GroundedCondition, shared_ptr<ActionNode>, GroundedConditionHasher, GroundedConditionComparator> ActionNodeNext;
+    vector<pair<unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator>, GroundedAction>> value;
+    bool end;
+
+    ActionNode() : end(false) {}
+};
+
+ActionNode rm;
 
 list<GroundedAction> planner(Env *env)
 {
@@ -951,7 +952,9 @@ list<GroundedAction> planner(Env *env)
 
                 GroundedAction ga(action.get_name(), ga_syms);
                 ActionNode *roadmap = &rm;
-                for (auto it = preconds.begin(); it != preconds.end(); ++it)
+                
+                auto it = preconds.begin();
+                while (it != preconds.end())
                 {
                     if (roadmap->ActionNodeNext.find(*it) == roadmap->ActionNodeNext.end())
                         roadmap->ActionNodeNext[*it] = make_shared<ActionNode>();
@@ -964,7 +967,10 @@ list<GroundedAction> planner(Env *env)
                         break;
                     }
                     else
+                    {
                         roadmap = roadmap->ActionNodeNext[*it].get();
+                    }
+                    ++it;
                 }
 
                 if (!next_permutation(symbol_seq.begin(), symbol_seq.end()))
