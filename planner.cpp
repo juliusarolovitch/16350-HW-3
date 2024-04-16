@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <stdexcept>
+#include <stack>
 
 #define SYMBOLS 0
 #define INITIAL 1
@@ -762,9 +763,7 @@ Env *create_env(char *filename)
     return env;
 }
 
-/// START
-
-struct CustomGC
+struct GCComparator
 {
     bool operator()(const GroundedCondition &lhs, const GroundedCondition &rhs) const
     {
@@ -774,58 +773,34 @@ struct CustomGC
 
 struct Node
 {
-    set<GroundedCondition, CustomGC> conditions;
     int g;
     int h;
     int f;
     shared_ptr<Node> parent;
     GroundedAction parent_action;
+    set<GroundedCondition, GCComparator> conditions;
 
-    Node() : g(INT_MAX), f(INT_MAX), parent(nullptr) {}
-    Node(const int g) : g(g), parent(nullptr) {}
-    Node(const set<GroundedCondition, CustomGC> &c) : conditions(c), g(INT_MAX), f(INT_MAX), parent(nullptr) {}
-    Node(const set<GroundedCondition, CustomGC> &c, const int h) : conditions(c), g(INT_MAX), f(INT_MAX), h(h), parent(nullptr) {}
-
-    bool operator==(const Node &rhs) const
-    {
-        if (this->conditions.size() != rhs.conditions.size())
-            return false;
-
-        return (this->conditions == rhs.conditions);
-    }
+    Node(const set<GroundedCondition, GCComparator> &c, const int h, const int g, const int f, shared_ptr<Node> ptr) : conditions(c), g(g), f(f), h(h), parent(ptr) {}
 };
 
 struct NodeHasher
 {
-    size_t operator()(const set<GroundedCondition, CustomGC> &gc_set) const
+    size_t operator()(const set<GroundedCondition, GCComparator> &gc_set) const
     {
-        string hashStr;
+        string h;
         for (auto cond : gc_set)
         {
-            hashStr += cond.toString();
+            h = cond.toString() + h;
         }
-        return hash<string>{}(hashStr);
+        return hash<string>{}(h);
     }
 };
 
 struct PlannerComparator
 {
-    bool operator()(const set<GroundedCondition, CustomGC> &lhs, const set<GroundedCondition, CustomGC> &rhs) const
+    bool operator()(const set<GroundedCondition, GCComparator> &lhs, const set<GroundedCondition, GCComparator> &rhs) const
     {
         return lhs == rhs;
-    }
-};
-
-struct ActionMapHasher
-{
-    size_t operator()(const set<GroundedCondition, CustomGC> &gc_set) const
-    {
-        string hashStr;
-        for (auto gc : gc_set)
-        {
-            hashStr += gc.toString();
-        }
-        return hash<string>{}(hashStr);
     }
 };
 
@@ -834,89 +809,132 @@ static auto compare = [](const shared_ptr<Node> &n1, const shared_ptr<Node> &n2)
     return n1->f > n2->f;
 };
 
-struct MultiDimMap
+struct ActionNode
 {
-    unordered_map<GroundedCondition, shared_ptr<MultiDimMap>, GroundedConditionHasher, GroundedConditionComparator> multimap;
+    unordered_map<GroundedCondition, shared_ptr<ActionNode>, GroundedConditionHasher, GroundedConditionComparator> multimap;
     vector<pair<unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator>, GroundedAction>> value;
     bool end;
 
-    MultiDimMap() : end(false) {}
+    ActionNode() : end(false) {}
 };
 
-// globals
-priority_queue<shared_ptr<Node>, vector<shared_ptr<Node>>, decltype(compare)> open_queue(compare);
-unordered_map<set<GroundedCondition, CustomGC>, shared_ptr<Node>, NodeHasher, PlannerComparator> nodes;
-unordered_set<set<GroundedCondition, CustomGC>, NodeHasher, PlannerComparator> closed;
+priority_queue<shared_ptr<Node>, vector<shared_ptr<Node>>, decltype(compare)> open(compare);
+unordered_map<set<GroundedCondition, GCComparator>, shared_ptr<Node>, NodeHasher, PlannerComparator> nodes;
+unordered_set<set<GroundedCondition, GCComparator>, NodeHasher, PlannerComparator> closed;
 
-MultiDimMap action_map;
+ActionNode rm;
 
-void generateCombos(const vector<string> &sym, int start, int k, vector<string> &curr, vector<vector<string>> &combos)
+int heuristic(
+    set<GroundedCondition, GCComparator> &goal_state,
+    set<GroundedCondition, GCComparator> &curr_state, bool use_heuristic)
 {
-    if (k == 0)
-    {
-        combos.push_back(curr);
-        return;
-    }
-    for (int i = start; i <= (sym.size() - k); ++i)
-    {
-        curr.push_back(sym[i]);
-        generateCombos(sym, i + 1, k - 1, curr, combos);
-        curr.pop_back();
-    }
-    return;
+    int h = 0;
+    if (!use_heuristic)
+        return h;
+    for (GroundedCondition cond : goal_state)
+        if (curr_state.find(cond) == curr_state.end())
+            h++;
+    return h;
 }
 
-void buildActionMap(
-    unordered_set<Action, ActionHasher, ActionComparator> &actions,
-    unordered_set<string> &symbols)
+list<GroundedAction> backtrack(std::__1::shared_ptr<Node> s, set<GroundedCondition, GCComparator> &goal)
 {
-    vector<string> sym;
-    for (string s : symbols)
+    list<GroundedAction> plan;
+    while (s)
     {
-        sym.push_back(s);
+        plan.push_back(s->parent_action);
+        s = s->parent;
     }
+    plan.pop_back();
+    plan.reverse();
+    return plan;
+}
 
-    sort(sym.begin(), sym.end()); // sort symbols alphabetically
+list<GroundedAction> planner(Env *env)
+{
+    bool use_heuristic = true;
+    chrono::steady_clock::time_point begin = chrono::steady_clock::now();
+    set<GroundedCondition, GCComparator> init, goal;
+    for (auto val : env->get_init_cond())
+        init.insert(val);
+    for (auto val : env->get_goal_cond())
+        goal.insert(val);
+
+    unordered_set<Action, ActionHasher, ActionComparator> all_actions = env->get_actions();
+    unordered_set<string> all_symbols = env->get_symbols();
+    vector<string> sym;
+    for (string s : all_symbols)
+        sym.push_back(s);
+
+    sort(sym.begin(), sym.end());
 
     vector<string> curr;
-    vector<vector<string>> combos;                                                                  // vector to store generated combos. need to permute over each element
-    set<GroundedCondition, CustomGC> preconds;                                                      // set of preconditions to add to the action map
-    unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator> effects; // set of effects to match the preconditions and add to action map
-    unordered_map<string, string> sym_map;                                                          // map to match symbols between grounded and non-grounded stuff
+    vector<vector<string>> combos;
+    set<GroundedCondition, GCComparator> preconds;
+    unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator> effects;
+    unordered_map<string, string> sym_map;
 
-    // loop over all possible actions in env
-    for (auto &action : actions)
+    for (auto &action : all_actions)
     {
-        combos.clear();                          // clear old combinations
-        int num_args = action.get_args().size(); // number of args in the action for combinations
+        combos.clear();
+        int num_args = action.get_args().size();
+        int n = sym.size();
+        int k = num_args;
+        if (!(k <= 0 || k > n))
+        {
+            vector<int> indices(k);
+            for (int i = 0; i < k; ++i)
+            {
+                indices[i] = i;
+            }
 
-        // generate all possible combinations of size 'num_args' from sym. stored in combos. then permute each element
-        generateCombos(sym, 0, num_args, curr, combos);
+            while (1)
+            {
+                vector<string> curr;
+                for (int index : indices)
+                {
+                    curr.push_back(sym[index]);
+                }
+                combos.push_back(curr);
 
-        // permute each element in combos
+                int i = k - 1;
+                while (i >= 0 && indices[i] == i + n - k)
+                {
+                    i--;
+                }
+
+                if (i < 0)
+                    break;
+
+                indices[i]++;
+                for (int j = i + 1; j < k; ++j)
+                {
+                    indices[j] = indices[j - 1] + 1;
+                }
+            }
+        }
+
         for (vector<string> symbol_seq : combos)
         {
             do
             {
-                sym_map.clear(); // clear the symbol map
+                sym_map.clear();
                 int ind = 0;
-                list<string> ga_syms;                       // list of actual symbols for grounded action
-                for (string action_sym : action.get_args()) // map action symbols (x, y, b) to actual symbols (A, B, Table) in order
+                list<string> ga_syms;
+                for (string action_sym : action.get_args())
                 {
                     sym_map[action_sym] = symbol_seq[ind];
                     ga_syms.push_back(symbol_seq[ind]);
-                    ++ind;
+                    ind++;
                 }
 
-                // generate and add precondition for this sequence of symbols for action_map
                 preconds.clear();
-                for (auto pc : action.get_preconditions())
+                for (Condition pc : action.get_preconditions())
                 {
-                    // pc is of type Condition - convert to a GroundedCondition
                     list<string> actual_args;
                     for (string pc_arg : pc.get_args())
                     {
-                        if (sym_map.find(pc_arg) != sym_map.end()) // if arg not in sym_map, use default arg
+                        if (sym_map.find(pc_arg) != sym_map.end())
                             actual_args.push_back(sym_map[pc_arg]);
                         else
                             actual_args.push_back(pc_arg);
@@ -925,15 +943,13 @@ void buildActionMap(
                     preconds.insert(gc_precond);
                 }
 
-                // generate and add effects for this precondition for action_map
                 effects.clear();
-                for (auto eff : action.get_effects())
+                for (Condition eff : action.get_effects())
                 {
-                    // eff is of type Condition - convert it to a GroundedCondition
                     list<string> actual_args;
                     for (string eff_arg : eff.get_args())
                     {
-                        if (sym_map.find(eff_arg) != sym_map.end()) // if arg not in sym_map, use default arg
+                        if (sym_map.find(eff_arg) != sym_map.end())
                             actual_args.push_back(sym_map[eff_arg]);
                         else
                             actual_args.push_back(eff_arg);
@@ -942,116 +958,49 @@ void buildActionMap(
                     effects.insert(gc_eff);
                 }
 
-                // create the specific grounded action for action_map
                 GroundedAction ga(action.get_name(), ga_syms);
-
-                // store precondition, effect and grounded action in multi layered action_map
-                MultiDimMap *multimap_ptr = &action_map; // no need to delete pointer since memory not on heap. normal ptr since not dynamically alloc
+                ActionNode *roadmap = &rm;
                 for (auto it = preconds.begin(); it != preconds.end(); ++it)
                 {
-                    if (multimap_ptr->multimap.find(*it) == multimap_ptr->multimap.end())
-                        multimap_ptr->multimap[*it] = make_shared<MultiDimMap>();
+                    if (roadmap->multimap.find(*it) == roadmap->multimap.end())
+                        roadmap->multimap[*it] = make_shared<ActionNode>();
 
-                    if (next(it) == preconds.end()) // reached end of precondition, store (effect, action) pair
+                    if (next(it) == preconds.end())
                     {
-                        multimap_ptr = multimap_ptr->multimap[*it].get(); // move to child node and store there
-                        multimap_ptr->end = true;
-                        multimap_ptr->value.push_back({effects, ga});
+                        roadmap = roadmap->multimap[*it].get();
+                        roadmap->end = true;
+                        roadmap->value.push_back({effects, ga});
                         break;
                     }
                     else
-                        multimap_ptr = multimap_ptr->multimap[*it].get();
+                        roadmap = roadmap->multimap[*it].get();
                 }
 
             } while (next_permutation(symbol_seq.begin(), symbol_seq.end()));
         }
     }
-}
 
-void findInActionMap(
-    const set<GroundedCondition, CustomGC> &state,
-    MultiDimMap *multimap_ptr,
-    vector<MultiDimMap *> &output,
-    int n)
-{
-    auto cond = state.begin();
-    if (n > 0)
-        advance(cond, n);
+    shared_ptr<Node> start = make_shared<Node>(init, heuristic(goal, init, use_heuristic), INT_MAX, INT_MAX, nullptr);
+    start->g = 0;
+    start->f = start->h;
+    nodes[init] = start;
+    open.push(start);
 
-    for (auto end = state.end(); cond != end; ++cond)
-    {
-        if (multimap_ptr->multimap.find(*cond) != multimap_ptr->multimap.end())
-        {
-            MultiDimMap *next_ptr = multimap_ptr->multimap[*cond].get();
-            findInActionMap(state, next_ptr, output, n + 1);
-        }
-    }
-
-    if (!multimap_ptr->value.empty())
-        output.push_back(multimap_ptr);
-
-    return;
-}
-
-void addEffectToState(
-    set<GroundedCondition, CustomGC> &state,
-    unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator> &effects)
-{
-    for (auto effect : effects)
-    {
-        if (!effect.get_truth())
-        {
-            state.erase(effect);
-        }
-        else
-        {
-            state.insert(effect);
-        }
-    }
-}
-
-bool isGoal(
-    set<GroundedCondition, CustomGC> &currState,
-    set<GroundedCondition, CustomGC> &goal)
-{
-    for (auto gc : goal)
-    {
-        if (currState.find(gc) == currState.end()) // current state doesn't contain goal condition
-            return false;
-    }
-    return true;
-}
-
-int heuristic(
-    set<GroundedCondition, CustomGC> &goal,
-    set<GroundedCondition, CustomGC> &child_conditions, bool use_heuristic)
-{
-    if (!use_heuristic)
-        return 0;
-    int h = 0;
-    for (auto cond : goal)
-    {
-        if (child_conditions.find(cond) == child_conditions.end())
-            ++h;
-    }
-    return h;
-}
-
-list<GroundedAction> computePath(set<GroundedCondition, CustomGC> &goal, bool use_heuristic)
-{
     int cost = 1;
-    while (!open_queue.empty())
+    while (!open.empty())
     {
-        shared_ptr<Node> s = open_queue.top();
-        open_queue.pop();
+        shared_ptr<Node> s = open.top();
 
         if (closed.find(s->conditions) != closed.end())
-            continue;                 // skip if already visited
-        closed.insert(s->conditions); // add to closed list
+            continue;
+        closed.insert(s->conditions);
+        bool goal_flag = true;
+        for (auto gc : goal)
+            if (s->conditions.find(gc) == s->conditions.end())
+                goal_flag = false;
 
-        if (isGoal(s->conditions, goal)) // check if goal
+        if (goal_flag)
         {
-            // goal found. backtrack
             list<GroundedAction> plan;
             while (s)
             {
@@ -1059,91 +1008,78 @@ list<GroundedAction> computePath(set<GroundedCondition, CustomGC> &goal, bool us
                 s = s->parent;
             }
             plan.pop_front();
+            chrono::steady_clock::time_point end = chrono::steady_clock::now();
+
+            cout << endl
+                 << "States expanded: " << closed.size() << endl;
+            cout << "Time: " << chrono::duration_cast<chrono::milliseconds>(end - begin).count() << " ms" << endl;
+
             return plan;
         }
 
         unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator> effect;
         GroundedAction grounded_action;
 
-        vector<MultiDimMap *> output;
-        findInActionMap(s->conditions, &action_map, output, 0);
+        vector<ActionNode *> output;
+        stack<pair<ActionNode *, set<GroundedCondition, GCComparator>::const_iterator>> stack;
+        stack.push({&rm, s->conditions.begin()});
 
-        for (MultiDimMap *solution_ptr : output)
+        while (!stack.empty())
+        {
+            auto curr = stack.top();
+            stack.pop();
+
+            for (auto end = s->conditions.end(); curr.second != end; ++curr.second)
+            {
+                if (curr.first->multimap.find(*curr.second) != curr.first->multimap.end())
+                {
+                    ActionNode *next_ptr = curr.first->multimap[*curr.second].get();
+                    stack.push({next_ptr, next(curr.second)});
+                }
+            }
+
+            if (!curr.first->value.empty())
+                output.push_back(curr.first);
+        }
+
+        for (ActionNode *solution_ptr : output)
         {
             for (auto effect_action_pair : solution_ptr->value)
             {
                 tie(effect, grounded_action) = effect_action_pair;
-                set<GroundedCondition, CustomGC> child_conditions = s->conditions;
-                // add effects to child conditions
-                addEffectToState(child_conditions, effect);
-
-                if (closed.find(child_conditions) == closed.end())
+                set<GroundedCondition, GCComparator> prev_conds = s->conditions;
+                for (auto e : effect)
                 {
-                    if (nodes.find(child_conditions) == nodes.end())
+                    if (!e.get_truth())
+                        prev_conds.erase(e);
+                    else
+                        prev_conds.insert(e);
+                }
+
+                if (closed.find(prev_conds) == closed.end())
+                {
+                    if (nodes.find(prev_conds) == nodes.end())
                     {
-                        int h = heuristic(goal, child_conditions, use_heuristic);
-                        shared_ptr<Node> newNode = make_shared<Node>(child_conditions, h);
-                        nodes[child_conditions] = newNode;
+                        int h = heuristic(goal, prev_conds, use_heuristic);
+                        shared_ptr<Node> newNode = make_shared<Node>(prev_conds, h, INT_MAX, INT_MAX, nullptr);
+                        nodes[prev_conds] = newNode;
                     }
-                    if (nodes[child_conditions]->g > (s->g + cost))
+                    if (nodes[prev_conds]->g > (s->g + cost))
                     {
-                        nodes[child_conditions]->g = s->g + cost;
-                        nodes[child_conditions]->f = nodes[child_conditions]->g + nodes[child_conditions]->h;
-                        nodes[child_conditions]->parent = s;
-                        nodes[child_conditions]->parent_action = grounded_action;
-                        open_queue.push(nodes[child_conditions]);
+                        nodes[prev_conds]->g = s->g + cost;
+                        nodes[prev_conds]->f = nodes[prev_conds]->g + nodes[prev_conds]->h;
+                        nodes[prev_conds]->parent = s;
+                        nodes[prev_conds]->parent_action = grounded_action;
+                        open.push(nodes[prev_conds]);
                     }
                 }
             }
         }
+        open.pop();
     }
 
     return list<GroundedAction>{};
 }
-
-set<GroundedCondition, CustomGC> unorderedToOrderedGC(
-    const unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator> &uos)
-{
-    set<GroundedCondition, CustomGC> out;
-    for (auto val : uos)
-    {
-        out.insert(val);
-    }
-    return out;
-}
-
-list<GroundedAction> planner(Env *env)
-{
-    bool use_heuristic = true;
-    chrono::steady_clock::time_point begin = chrono::steady_clock::now();
-    set<GroundedCondition, CustomGC> init, goal;
-    init = unorderedToOrderedGC(env->get_init_cond());
-    goal = unorderedToOrderedGC(env->get_goal_cond());
-
-    unordered_set<Action, ActionHasher, ActionComparator> all_actions = env->get_actions();
-    unordered_set<string> all_symbols = env->get_symbols();
-    buildActionMap(all_actions, all_symbols);
-
-    int h_start = heuristic(goal, init, use_heuristic);
-    shared_ptr<Node> start = make_shared<Node>(init, h_start);
-    start->g = 0;
-    start->f = start->h;
-    nodes[init] = start;
-    open_queue.push(start);
-
-    list<GroundedAction> actions;
-    actions = computePath(goal, use_heuristic);
-
-    chrono::steady_clock::time_point end = chrono::steady_clock::now();
-
-    cout << endl
-         << "Num of states expanded: " << closed.size() << endl;
-    cout << "Time to plan = " << chrono::duration_cast<chrono::milliseconds>(end - begin).count() << " ms" << endl;
-
-    return actions;
-}
-
-/// END
 
 int main(int argc, char *argv[])
 {
