@@ -811,18 +811,17 @@ static auto compare = [](const shared_ptr<Node> &n1, const shared_ptr<Node> &n2)
 
 struct ActionNode
 {
-    unordered_map<GroundedCondition, shared_ptr<ActionNode>, GroundedConditionHasher, GroundedConditionComparator> multimap;
+    unordered_map<GroundedCondition, shared_ptr<ActionNode>, GroundedConditionHasher, GroundedConditionComparator> ActionNodeNext;
     vector<pair<unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator>, GroundedAction>> value;
     bool end;
 
     ActionNode() : end(false) {}
 };
 
+ActionNode rm;
 priority_queue<shared_ptr<Node>, vector<shared_ptr<Node>>, decltype(compare)> open(compare);
 unordered_map<set<GroundedCondition, GCComparator>, shared_ptr<Node>, NodeHasher, PlannerComparator> nodes;
 unordered_set<set<GroundedCondition, GCComparator>, NodeHasher, PlannerComparator> closed;
-
-ActionNode rm;
 
 int heuristic(
     set<GroundedCondition, GCComparator> &goal_state,
@@ -884,39 +883,33 @@ list<GroundedAction> planner(Env *env)
         {
             vector<int> indices(k);
             for (int i = 0; i < k; ++i)
-            {
                 indices[i] = i;
-            }
 
             while (1)
             {
                 vector<string> curr;
                 for (int index : indices)
-                {
                     curr.push_back(sym[index]);
-                }
                 combos.push_back(curr);
 
                 int i = k - 1;
                 while (i >= 0 && indices[i] == i + n - k)
-                {
                     i--;
-                }
 
                 if (i < 0)
                     break;
 
                 indices[i]++;
                 for (int j = i + 1; j < k; ++j)
-                {
                     indices[j] = indices[j - 1] + 1;
-                }
             }
         }
 
         for (vector<string> symbol_seq : combos)
         {
-            do
+            sort(symbol_seq.begin(), symbol_seq.end());
+
+            while (1)
             {
                 sym_map.clear();
                 int ind = 0;
@@ -933,12 +926,10 @@ list<GroundedAction> planner(Env *env)
                 {
                     list<string> actual_args;
                     for (string pc_arg : pc.get_args())
-                    {
                         if (sym_map.find(pc_arg) != sym_map.end())
                             actual_args.push_back(sym_map[pc_arg]);
                         else
                             actual_args.push_back(pc_arg);
-                    }
                     GroundedCondition gc_precond(pc.get_predicate(), actual_args, pc.get_truth());
                     preconds.insert(gc_precond);
                 }
@@ -962,21 +953,23 @@ list<GroundedAction> planner(Env *env)
                 ActionNode *roadmap = &rm;
                 for (auto it = preconds.begin(); it != preconds.end(); ++it)
                 {
-                    if (roadmap->multimap.find(*it) == roadmap->multimap.end())
-                        roadmap->multimap[*it] = make_shared<ActionNode>();
+                    if (roadmap->ActionNodeNext.find(*it) == roadmap->ActionNodeNext.end())
+                        roadmap->ActionNodeNext[*it] = make_shared<ActionNode>();
 
                     if (next(it) == preconds.end())
                     {
-                        roadmap = roadmap->multimap[*it].get();
+                        roadmap = roadmap->ActionNodeNext[*it].get();
                         roadmap->end = true;
                         roadmap->value.push_back({effects, ga});
                         break;
                     }
                     else
-                        roadmap = roadmap->multimap[*it].get();
+                        roadmap = roadmap->ActionNodeNext[*it].get();
                 }
 
-            } while (next_permutation(symbol_seq.begin(), symbol_seq.end()));
+                if (!next_permutation(symbol_seq.begin(), symbol_seq.end()))
+                    break;
+            }
         }
     }
 
@@ -1010,9 +1003,9 @@ list<GroundedAction> planner(Env *env)
             plan.pop_front();
             chrono::steady_clock::time_point end = chrono::steady_clock::now();
 
+            cout << "Time: " << chrono::duration_cast<chrono::milliseconds>(end - begin).count() << " ms" << endl;
             cout << endl
                  << "States expanded: " << closed.size() << endl;
-            cout << "Time: " << chrono::duration_cast<chrono::milliseconds>(end - begin).count() << " ms" << endl;
 
             return plan;
         }
@@ -1031,9 +1024,9 @@ list<GroundedAction> planner(Env *env)
 
             for (auto end = s->conditions.end(); curr.second != end; ++curr.second)
             {
-                if (curr.first->multimap.find(*curr.second) != curr.first->multimap.end())
+                if (curr.first->ActionNodeNext.find(*curr.second) != curr.first->ActionNodeNext.end())
                 {
-                    ActionNode *next_ptr = curr.first->multimap[*curr.second].get();
+                    ActionNode *next_ptr = curr.first->ActionNodeNext[*curr.second].get();
                     stack.push({next_ptr, next(curr.second)});
                 }
             }
