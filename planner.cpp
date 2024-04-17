@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <stack>
+#include <functional>
 
 #define SYMBOLS 0
 #define INITIAL 1
@@ -775,24 +776,26 @@ struct Node
 {
     int g;
     int h;
-    int f;
-    shared_ptr<Node> parent;
-    GroundedAction parent_action;
+    shared_ptr<Node> prev;
+    GroundedAction prev_action;
     set<GroundedCondition, GCComparator> conditions;
 
-    Node(const set<GroundedCondition, GCComparator> &c, const int h, const int g, const int f, shared_ptr<Node> ptr) : conditions(c), g(g), f(f), h(h), parent(ptr) {}
+    Node(set<GroundedCondition, GCComparator> &c, int h, int g, shared_ptr<Node> ptr) : conditions(c), g(g), h(h), prev(ptr) {}
 };
 
 struct NodeHasher
 {
-    size_t operator()(const set<GroundedCondition, GCComparator> &gc_set) const
+    std::size_t operator()(const std::set<GroundedCondition, GCComparator> &gc_set) const
     {
-        string h;
-        for (auto cond : gc_set)
+        std::size_t combined_hash = 0;
+
+        for (const auto &cond : gc_set)
         {
-            h = cond.toString() + h;
+            std::size_t cond_hash = std::hash<std::string>{}(cond.toString());
+            combined_hash ^= cond_hash + 0x9e3779b9 + (combined_hash << 6) + (combined_hash >> 2);
         }
-        return hash<string>{}(h);
+
+        return combined_hash;
     }
 };
 
@@ -804,61 +807,43 @@ struct PlannerComparator
     }
 };
 
-static auto compare = [](const shared_ptr<Node> &n1, const shared_ptr<Node> &n2)
+struct PriorityFunction
 {
-    return n1->f > n2->f;
+    bool operator()(const shared_ptr<Node> &n1, const shared_ptr<Node> &n2) const
+    {
+        return (n1->g + n1->h) > (n2->g + n2->h);
+    }
 };
 
-priority_queue<shared_ptr<Node>, vector<shared_ptr<Node>>, decltype(compare)> open(compare);
-unordered_map<set<GroundedCondition, GCComparator>, shared_ptr<Node>, NodeHasher, PlannerComparator> nodes;
+priority_queue<shared_ptr<Node>, vector<shared_ptr<Node>>, PriorityFunction> open;
 unordered_set<set<GroundedCondition, GCComparator>, NodeHasher, PlannerComparator> closed;
 
 int heuristic(
     set<GroundedCondition, GCComparator> &goal_state,
-    set<GroundedCondition, GCComparator> &curr_state, bool use_heuristic)
+    set<GroundedCondition, GCComparator> &current_state, bool use_heuristic)
 {
     int h = 0;
     if (!use_heuristic)
         return h;
     for (GroundedCondition cond : goal_state)
-        if (curr_state.find(cond) == curr_state.end())
+        if (current_state.find(cond) == current_state.end())
             h++;
     return h;
-}
-
-list<GroundedAction> backtrack(std::__1::shared_ptr<Node> s, set<GroundedCondition, GCComparator> &goal)
-{
-    list<GroundedAction> plan;
-    while (s)
-    {
-        plan.push_back(s->parent_action);
-        s = s->parent;
-    }
-    plan.pop_back();
-    plan.reverse();
-    return plan;
 }
 
 struct ActionNode
 {
     unordered_map<GroundedCondition, shared_ptr<ActionNode>, GroundedConditionHasher, GroundedConditionComparator> ActionNodeNext;
-    vector<pair<unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator>, GroundedAction>> value;
-    bool end;
-
-    ActionNode() : end(false) {}
+    vector<pair<unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator>, GroundedAction>> LeafNodeGA;
 };
 
-ActionNode rm;
+ActionNode grounded_action_tree;
 
 list<GroundedAction> planner(Env *env)
 {
+    std::cout << "PLANNER CALLED" << endl;
     bool use_heuristic = true;
     chrono::steady_clock::time_point begin = chrono::steady_clock::now();
-    set<GroundedCondition, GCComparator> init, goal;
-    for (auto val : env->get_init_cond())
-        init.insert(val);
-    for (auto val : env->get_goal_cond())
-        goal.insert(val);
 
     unordered_set<Action, ActionHasher, ActionComparator> all_actions = env->get_actions();
     unordered_set<string> all_symbols = env->get_symbols();
@@ -866,17 +851,13 @@ list<GroundedAction> planner(Env *env)
     for (string s : all_symbols)
         sym.push_back(s);
 
-    sort(sym.begin(), sym.end());
-
-    vector<string> curr;
-    vector<vector<string>> combos;
-    set<GroundedCondition, GCComparator> preconds;
-    unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator> effects;
-    unordered_map<string, string> sym_map;
+    vector<string> current;
+    vector<vector<string>> combinations;
+    set<GroundedCondition, GCComparator> preconditions;
 
     for (auto &action : all_actions)
     {
-        combos.clear();
+        combinations.clear();
         int num_args = action.get_args().size();
         int n = sym.size();
         int k = num_args;
@@ -888,10 +869,10 @@ list<GroundedAction> planner(Env *env)
 
             while (1)
             {
-                vector<string> curr;
+                vector<string> current;
                 for (int index : indices)
-                    curr.push_back(sym[index]);
-                combos.push_back(curr);
+                    current.push_back(sym[index]);
+                combinations.push_back(current);
 
                 int i = k - 1;
                 while (i >= 0 && indices[i] == i + n - k)
@@ -905,72 +886,69 @@ list<GroundedAction> planner(Env *env)
                     indices[j] = indices[j - 1] + 1;
             }
         }
+        unordered_map<string, string> symbol_map;
+        unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator> effects;
 
-        for (vector<string> symbol_seq : combos)
+        for (vector<string> symbol_seq : combinations)
         {
-            sort(symbol_seq.begin(), symbol_seq.end());
-
             while (1)
             {
-                sym_map.clear();
-                int ind = 0;
-                list<string> ga_syms;
-                for (string action_sym : action.get_args())
-                {
-                    sym_map[action_sym] = symbol_seq[ind];
-                    ga_syms.push_back(symbol_seq[ind]);
-                    ind++;
-                }
-
-                preconds.clear();
-                for (Condition pc : action.get_preconditions())
-                {
-                    list<string> actual_args;
-                    for (string pc_arg : pc.get_args())
-                        if (sym_map.find(pc_arg) != sym_map.end())
-                            actual_args.push_back(sym_map[pc_arg]);
-                        else
-                            actual_args.push_back(pc_arg);
-                    GroundedCondition gc_precond(pc.get_predicate(), actual_args, pc.get_truth());
-                    preconds.insert(gc_precond);
-                }
-
+                symbol_map.clear();
                 effects.clear();
-                for (Condition eff : action.get_effects())
+                preconditions.clear();
+
+                int ind = 0;
+                list<string> grounded_action_symbols;
+                auto args = action.get_args();
+                auto arg_it = args.begin();
+                for (size_t i = 0; i < args.size() && arg_it != args.end(); ++i, ++arg_it)
+                {
+                    symbol_map[*arg_it] = symbol_seq[i];
+                    grounded_action_symbols.push_back(symbol_seq[i]);
+                }
+
+                auto preconditionsList = action.get_preconditions();
+                for (auto it = preconditionsList.begin(); it != preconditionsList.end(); ++it)
                 {
                     list<string> actual_args;
-                    for (string eff_arg : eff.get_args())
+                    auto preconditionArgs = it->get_args();
+                    for (auto argIt = preconditionArgs.begin(); argIt != preconditionArgs.end(); ++argIt)
                     {
-                        if (sym_map.find(eff_arg) != sym_map.end())
-                            actual_args.push_back(sym_map[eff_arg]);
-                        else
-                            actual_args.push_back(eff_arg);
+                        actual_args.push_back(symbol_map.find(*argIt) != symbol_map.end() ? symbol_map[*argIt] : *argIt);
                     }
-                    GroundedCondition gc_eff(eff.get_predicate(), actual_args, eff.get_truth());
+                    GroundedCondition gc_precond(it->get_predicate(), actual_args, it->get_truth());
+                    preconditions.insert(gc_precond);
+                }
+
+                auto effectsList = action.get_effects();
+                for (auto it = effectsList.begin(); it != effectsList.end(); ++it)
+                {
+                    list<string> actual_args;
+                    auto effectArgs = it->get_args();
+                    for (auto argIt = effectArgs.begin(); argIt != effectArgs.end(); ++argIt)
+                    {
+                        actual_args.push_back(symbol_map.find(*argIt) != symbol_map.end() ? symbol_map[*argIt] : *argIt);
+                    }
+                    GroundedCondition gc_eff(it->get_predicate(), actual_args, it->get_truth());
                     effects.insert(gc_eff);
                 }
 
-                GroundedAction ga(action.get_name(), ga_syms);
-                ActionNode *roadmap = &rm;
-                
-                auto it = preconds.begin();
-                while (it != preconds.end())
-                {
-                    if (roadmap->ActionNodeNext.find(*it) == roadmap->ActionNodeNext.end())
-                        roadmap->ActionNodeNext[*it] = make_shared<ActionNode>();
+                GroundedAction ga(action.get_name(), grounded_action_symbols);
+                ActionNode *tree = &grounded_action_tree;
 
-                    if (next(it) == preconds.end())
+                auto it = preconditions.begin();
+                while (it != preconditions.end())
+                {
+                    if (tree->ActionNodeNext.find(*it) == tree->ActionNodeNext.end())
+                        tree->ActionNodeNext[*it] = make_shared<ActionNode>();
+                    tree = tree->ActionNodeNext[*it].get();
+
+                    if (next(it) == preconditions.end())
                     {
-                        roadmap = roadmap->ActionNodeNext[*it].get();
-                        roadmap->end = true;
-                        roadmap->value.push_back({effects, ga});
+                        tree->LeafNodeGA.push_back({effects, ga});
                         break;
                     }
-                    else
-                    {
-                        roadmap = roadmap->ActionNodeNext[*it].get();
-                    }
-                    ++it;
+                    it++;
                 }
 
                 if (!next_permutation(symbol_seq.begin(), symbol_seq.end()))
@@ -978,105 +956,114 @@ list<GroundedAction> planner(Env *env)
             }
         }
     }
+    set<GroundedCondition, GCComparator> init, goal;
+    for (GroundedCondition val : env->get_init_cond())
+        init.insert(val);
+    for (GroundedCondition val : env->get_goal_cond())
+        goal.insert(val);
+    shared_ptr<Node> start = make_shared<Node>(init, heuristic(goal, init, use_heuristic), 0, nullptr);
+    unordered_map<set<GroundedCondition, GCComparator>, shared_ptr<Node>, NodeHasher, PlannerComparator> nodes_masterlist;
 
-    shared_ptr<Node> start = make_shared<Node>(init, heuristic(goal, init, use_heuristic), INT_MAX, INT_MAX, nullptr);
-    start->g = 0;
-    start->f = start->h;
-    nodes[init] = start;
+    nodes_masterlist[init] = start;
     open.push(start);
 
-    int cost = 1;
     while (!open.empty())
     {
         shared_ptr<Node> s = open.top();
+        open.pop();
 
         if (closed.find(s->conditions) != closed.end())
             continue;
         closed.insert(s->conditions);
-        bool goal_flag = true;
-        for (auto gc : goal)
-            if (s->conditions.find(gc) == s->conditions.end())
-                goal_flag = false;
 
-        if (goal_flag)
+        if (std::all_of(goal.begin(), goal.end(),
+                        [&s](const auto &gc)
+                        { return s->conditions.find(gc) != s->conditions.end(); }))
         {
             list<GroundedAction> plan;
             while (s)
             {
-                plan.push_front(s->parent_action);
-                s = s->parent;
+                plan.push_back(s->prev_action);
+                s = s->prev;
             }
-            plan.pop_front();
+            plan.pop_back();
+            plan.reverse();
             chrono::steady_clock::time_point end = chrono::steady_clock::now();
 
-            cout << "Time: " << chrono::duration_cast<chrono::milliseconds>(end - begin).count() << " ms" << endl;
-            cout << endl
-                 << "States expanded: " << closed.size() << endl;
+            std::cout << "Time: " << chrono::duration_cast<chrono::milliseconds>(end - begin).count() << " ms" << endl;
+            std::cout << endl
+                      << "States expanded: " << closed.size() << endl;
 
             return plan;
         }
 
         unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator> effect;
-        GroundedAction grounded_action;
+        GroundedAction grounded_action();
 
-        vector<ActionNode *> output;
-        stack<pair<ActionNode *, set<GroundedCondition, GCComparator>::const_iterator>> stack;
-        stack.push({&rm, s->conditions.begin()});
+        vector<vector<pair<unordered_set<GroundedCondition, GroundedConditionHasher, GroundedConditionComparator>, GroundedAction>>> possible_actions;
+        queue<pair<ActionNode *, set<GroundedCondition, GCComparator>::const_iterator>> queue;
+        queue.push({&grounded_action_tree, s->conditions.begin()});
 
-        while (!stack.empty())
+        while (!queue.empty())
         {
-            auto curr = stack.top();
-            stack.pop();
+            auto [current, condition] = queue.front();
+            queue.pop();
 
-            for (auto end = s->conditions.end(); curr.second != end; ++curr.second)
+            for (; condition != s->conditions.end(); ++condition)
             {
-                if (curr.first->ActionNodeNext.find(*curr.second) != curr.first->ActionNodeNext.end())
+                if (current->ActionNodeNext.find(*condition) != current->ActionNodeNext.end())
                 {
-                    ActionNode *next_ptr = curr.first->ActionNodeNext[*curr.second].get();
-                    stack.push({next_ptr, next(curr.second)});
+                    ActionNode *next_ptr = current->ActionNodeNext[*condition].get();
+                    queue.push({next_ptr, next(condition)});
                 }
             }
 
-            if (!curr.first->value.empty())
-                output.push_back(curr.first);
+            if (!current->LeafNodeGA.empty())
+                possible_actions.push_back(current->LeafNodeGA);
         }
 
-        for (ActionNode *solution_ptr : output)
+        for (auto action_iter = possible_actions.begin(); action_iter != possible_actions.end(); ++action_iter)
         {
-            for (auto effect_action_pair : solution_ptr->value)
+            for (auto pair_iter = action_iter->begin(); pair_iter != action_iter->end(); ++pair_iter)
             {
-                tie(effect, grounded_action) = effect_action_pair;
-                set<GroundedCondition, GCComparator> prev_conds = s->conditions;
-                for (auto e : effect)
-                {
+                const auto &[effect, grounded_action] = *pair_iter;
+
+                set<GroundedCondition, GCComparator> prev_conds(s->conditions);
+
+                for (const auto &e : effect)
                     if (!e.get_truth())
                         prev_conds.erase(e);
                     else
                         prev_conds.insert(e);
-                }
 
-                if (closed.find(prev_conds) == closed.end())
+                if (closed.find(prev_conds) != closed.end())
+                    continue;
+
+                int h = heuristic(goal, prev_conds, use_heuristic);
+
+                if (nodes_masterlist.find(prev_conds) == nodes_masterlist.end())
                 {
-                    if (nodes.find(prev_conds) == nodes.end())
-                    {
-                        int h = heuristic(goal, prev_conds, use_heuristic);
-                        shared_ptr<Node> newNode = make_shared<Node>(prev_conds, h, INT_MAX, INT_MAX, nullptr);
-                        nodes[prev_conds] = newNode;
-                    }
-                    if (nodes[prev_conds]->g > (s->g + cost))
-                    {
-                        nodes[prev_conds]->g = s->g + cost;
-                        nodes[prev_conds]->f = nodes[prev_conds]->g + nodes[prev_conds]->h;
-                        nodes[prev_conds]->parent = s;
-                        nodes[prev_conds]->parent_action = grounded_action;
-                        open.push(nodes[prev_conds]);
-                    }
+                    shared_ptr<Node> newNode = make_shared<Node>(prev_conds, h, s->g + 1, nullptr);
+                    nodes_masterlist[prev_conds] = newNode;
+                    nodes_masterlist[prev_conds]->prev = s;
+                    nodes_masterlist[prev_conds]->prev_action = grounded_action;
+                    open.push(nodes_masterlist[prev_conds]);
+                }
+                else if (nodes_masterlist[prev_conds]->g > (s->g + 1))
+                {
+                    nodes_masterlist[prev_conds]->g = s->g + 1;
+                    nodes_masterlist[prev_conds]->prev = s;
+                    nodes_masterlist[prev_conds]->prev_action = grounded_action;
+                    open.push(nodes_masterlist[prev_conds]);
                 }
             }
         }
-        open.pop();
     }
-
+    chrono::steady_clock::time_point end = chrono::steady_clock::now();
+    std::cout << "Time: " << chrono::duration_cast<chrono::milliseconds>(end - begin).count() << " ms" << endl;
+    std::cout << endl
+              << "States expanded: " << closed.size() << endl;
+    std::cout << "NO PATH FOUND" << endl;
     return list<GroundedAction>{};
 }
 
